@@ -1,0 +1,25 @@
+{
+    "name": "distributed-system-demo",
+    "version": "1.0.0",
+    "description": "Distributed Content Moderation Platform",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js",
+        "start:worker1": "cross-env PORT=4001 WORKER_ID=worker1 node worker.js",
+        "start:worker2": "cross-env PORT=4002 WORKER_ID=worker2 node worker.js",
+        "start:worker3": "cross-env PORT=4003 WORKER_ID=worker3 node worker.js",
+        "start:all": "concurrently \"npm start\" \"npm run start:worker1\" \"npm run start:worker2\" \"npm run start:worker3\""
+    },
+    "dependencies": {
+        "amqplib": "^0.10.3",
+        "axios": "^1.6.3",
+        "cors": "^2.8.5",
+        "express": "^4.18.2",
+        "fs-nextra": "^0.5.1",
+        "uuid": "^9.0.1"
+    },
+    "devDependencies": {
+        "concurrently": "^8.2.2",
+        "cross-env": "^7.0.3"
+    }
+}
