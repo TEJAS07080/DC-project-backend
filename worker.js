@@ -1,44 +1,100 @@
-// worker.js - Enhanced Worker Node for Content Moderation
+require('dotenv').config();
 const express = require('express');
 const amqp = require('amqplib');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
+const axios = require('axios');
 const { writeFileAtomic } = require('fs-nextra');
 
 const app = express();
 const PORT = process.env.PORT || 4001;
 const WORKER_ID = process.env.WORKER_ID || `worker-${PORT}`;
 const DATA_STORE = path.join(__dirname, 'data', 'posts.json');
+const PERSPECTIVE_API_KEY = process.env.PERSPECTIVE_API_KEY;
+
+if (!PERSPECTIVE_API_KEY) {
+  console.error('PERSPECTIVE_API_KEY environment variable is required');
+  process.exit(1);
+}
 
 app.use(cors());
 app.use(express.json());
 
-// Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).send({ status: 'ok', workerId: WORKER_ID });
 });
 
-// Simple moderation logic (keyword-based)
-function moderateContent(content) {
-  const blockedKeywords = ['spam', 'offensive', 'inappropriate', 'hate'];
+async function moderateContent(content) {
+  // Step 1: Rule-based check for egregious content
+  const blockedKeywords = ['fuck', 'nigger']; // Add more as needed
   const lowercaseContent = content.toLowerCase();
   const foundKeyword = blockedKeywords.find(keyword => lowercaseContent.includes(keyword));
   
   if (foundKeyword) {
     return {
       status: 'rejected',
-      moderationDetails: `Content rejected due to keyword: ${foundKeyword}`,
+      moderationDetails: `Content rejected due to egregious keyword: ${foundKeyword}`,
+      toxicityScore: null,
+      reviewReason: null,
     };
   }
-  
-  return {
-    status: 'approved',
-    moderationDetails: 'Content approved after review',
-  };
+
+  // Step 2: Perspective API analysis
+  try {
+    const response = await axios.post(
+      `https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze?key=${PERSPECTIVE_API_KEY}`,
+      {
+        comment: { text: content },
+        requestedAttributes: {
+          TOXICITY: {},
+          INSULT: {},
+          PROFANITY: {},
+        },
+        languages: ['en'],
+      }
+    );
+
+    const scores = response.data.attributeScores;
+    const toxicityScore = scores.TOXICITY.summaryScore.value;
+    const insultScore = scores.INSULT.summaryScore.value;
+    const profanityScore = scores.PROFANITY.summaryScore.value;
+    const maxScore = Math.max(toxicityScore, insultScore, profanityScore);
+
+    // Step 3: Decision logic
+    if (maxScore > 0.8) {
+      return {
+        status: 'rejected',
+        moderationDetails: `Content rejected due to high scores: toxicity=${toxicityScore.toFixed(2)}, insult=${insultScore.toFixed(2)}, profanity=${profanityScore.toFixed(2)}`,
+        toxicityScore: maxScore,
+        reviewReason: null,
+      };
+    } else if (maxScore >= 0.5) {
+      return {
+        status: 'needs_review',
+        moderationDetails: `Content flagged for human review: toxicity=${toxicityScore.toFixed(2)}, insult=${insultScore.toFixed(2)}, profanity=${profanityScore.toFixed(2)}`,
+        toxicityScore: maxScore,
+        reviewReason: 'Borderline content requiring human evaluation',
+      };
+    } else {
+      return {
+        status: 'approved',
+        moderationDetails: `Content approved: toxicity=${toxicityScore.toFixed(2)}, insult=${insultScore.toFixed(2)}, profanity=${profanityScore.toFixed(2)}`,
+        toxicityScore: maxScore,
+        reviewReason: null,
+      };
+    }
+  } catch (error) {
+    console.error('Perspective API error:', error.response?.data || error.message);
+    return {
+      status: 'needs_review',
+      moderationDetails: 'Failed to analyze content with Perspective API',
+      toxicityScore: null,
+      reviewReason: 'API error, requires human review',
+    };
+  }
 }
 
-// Read posts safely
 async function readPosts() {
   try {
     if (fs.existsSync(DATA_STORE)) {
@@ -53,7 +109,6 @@ async function readPosts() {
   }
 }
 
-// Write posts atomically
 async function writePosts(posts) {
   try {
     const dataDir = path.dirname(DATA_STORE);
@@ -67,8 +122,7 @@ async function writePosts(posts) {
   }
 }
 
-// Update post status
-async function updatePostStatus(postId, status, workerId, moderationDetails = null) {
+async function updatePostStatus(postId, status, workerId, moderationDetails = null, processingTime = null, toxicityScore = null, reviewReason = null) {
   try {
     const posts = await readPosts();
     const postIndex = posts.findIndex(p => p.id === postId);
@@ -78,6 +132,15 @@ async function updatePostStatus(postId, status, workerId, moderationDetails = nu
       posts[postIndex].worker = workerId;
       if (moderationDetails) {
         posts[postIndex].moderationDetails = moderationDetails;
+      }
+      if (processingTime) {
+        posts[postIndex].processingTime = processingTime;
+      }
+      if (toxicityScore !== null) {
+        posts[postIndex].toxicityScore = toxicityScore;
+      }
+      if (reviewReason) {
+        posts[postIndex].reviewReason = reviewReason;
       }
       if (status === 'approved' || status === 'rejected') {
         posts[postIndex].completedAt = new Date().toISOString();
@@ -92,7 +155,6 @@ async function updatePostStatus(postId, status, workerId, moderationDetails = nu
   }
 }
 
-// Connect to RabbitMQ and process posts
 async function connectAndConsume() {
   try {
     const connection = await amqp.connect('amqp://localhost');
@@ -111,14 +173,11 @@ async function connectAndConsume() {
 
         await updatePostStatus(post.id, 'processing', WORKER_ID);
 
-        // Simulate processing time
-        const processingTime = Math.random() * 3000 + 1000;
-        await new Promise(resolve => setTimeout(resolve, processingTime));
+        const startTime = Date.now();
+        const { status, moderationDetails, toxicityScore, reviewReason } = await moderateContent(post.content);
+        const processingTime = Date.now() - startTime;
 
-        // Moderate content
-        const { status, moderationDetails } = moderateContent(post.content);
-
-        await updatePostStatus(post.id, status, WORKER_ID, moderationDetails);
+        await updatePostStatus(post.id, status, WORKER_ID, moderationDetails, processingTime, toxicityScore, reviewReason);
 
         channel.ack(msg);
       }
@@ -134,7 +193,6 @@ async function connectAndConsume() {
   }
 }
 
-// Start server
 app.listen(PORT, () => {
   console.log(`${WORKER_ID} running on port ${PORT}`);
   connectAndConsume();
