@@ -1,51 +1,106 @@
 require('dotenv').config();
-   const express = require('express');
-   const cors = require('cors');
-   const amqp = require('amqplib');
-   const { MongoClient } = require('mongodb');
-   const { v4: uuidv4 } = require('uuid');
+const express = require('express');
+const cors = require('cors');
+const amqp = require('amqplib');
+const { MongoClient } = require('mongodb');
+const { v4: uuidv4 } = require('uuid');
 
-   const app = express();
-   const port = process.env.PORT || 3001;
+const app = express();
+const port = process.env.PORT || 3001;
 
-   app.use(cors());
-   app.use(express.json());
+app.use(cors());
+app.use(express.json());
 
-   // MongoDB connection
-   const mongoUri = process.env.MONGO_URI || 'mongodb://root:secret@mongodb:27017';
-   const dbName = process.env.MONGO_DB || 'content_moderation';
-   let db;
+// MongoDB connection
+const mongoUri = process.env.MONGO_URI || 'mongodb://root:secret@mongodb:27017';
+const dbName = process.env.MONGO_DB || 'content_moderation';
+let db;
 
-   async function connectToMongo() {
-     try {
-       const client = new MongoClient(mongoUri);
-       await client.connect();
-       console.log('Connected to MongoDB');
-       db = client.db(dbName);
-     } catch (error) {
-       console.error('MongoDB connection error:', error);
-       process.exit(1);
-     }
-   }
+async function connectToMongo() {
+  try {
+    const client = new MongoClient(mongoUri);
+    await client.connect();
+    console.log('Connected to MongoDB');
+    db = client.db(dbName);
+  } catch (error) {
+    console.error('MongoDB connection error:', error);
+    process.exit(1);
+  }
+}
 
-   // RabbitMQ connection
-   const rabbitMQUrl = process.env.RABBITMQ_URL || 'amqp://guest:guest@rabbitmq:5672';
-   let channel;
+// RabbitMQ connection
+const rabbitMQUrl = process.env.RABBITMQ_URL || 'amqp://guest:guest@rabbitmq:5672';
+let channel;
 
-   async function connectToRabbitMQ() {
-     try {
-       const connection = await amqp.connect(rabbitMQUrl);
-       channel = await connection.createChannel();
-       await channel.assertQueue('moderation_queue', { durable: true });
-       console.log('Connected to RabbitMQ');
-     } catch (error) {
-       console.error('RabbitMQ connection error:', error);
-       setTimeout(connectToRabbitMQ, 5000);
-     }
-   }
+async function connectToRabbitMQ() {
+  try {
+    const connection = await amqp.connect(rabbitMQUrl);
+    channel = await connection.createChannel();
+    await channel.assertQueue('moderation_queue', { durable: true });
+    console.log('Connected to RabbitMQ');
 
-   connectToMongo();
-   connectToRabbitMQ();
+    // Handle connection close
+    connection.on('close', () => {
+      console.error('RabbitMQ connection closed, attempting to reconnect...');
+      channel = null;
+      setTimeout(connectToRabbitMQ, 5000);
+    });
+  } catch (error) {
+    console.error('RabbitMQ connection error:', error);
+    setTimeout(connectToRabbitMQ, 5000);
+  }
+}
+
+// Check RabbitMQ health
+async function checkRabbitMQHealth() {
+  if (!channel) return false;
+  try {
+    // Attempt to create a temporary channel to verify connection
+    const connection = await amqp.connect(rabbitMQUrl);
+    const tempChannel = await connection.createChannel();
+    await tempChannel.close();
+    await connection.close();
+    return true;
+  } catch (error) {
+    console.error('RabbitMQ health check failed:', error);
+    return false;
+  }
+}
+
+connectToMongo();
+connectToRabbitMQ();
+
+// API Endpoints
+app.get('/api/status', async (req, res) => {
+  try {
+    const statuses = {
+      server1: true, // Backend server is always true if this endpoint is reachable
+      rabbitmq: await checkRabbitMQHealth(),
+    };
+
+    // Check worker statuses based on heartbeats
+    const workers = ['worker-1', 'worker-2', 'worker-3'];
+    const heartbeatThreshold = 30 * 1000; // 30 seconds
+    const now = new Date();
+
+    for (const workerId of workers) {
+      const heartbeat = await db.collection('worker_heartbeats').findOne({ workerId });
+      if (heartbeat && now - new Date(heartbeat.lastSeen) < heartbeatThreshold) {
+        const processingPosts = await db.collection('posts')
+          .find({ worker: workerId, status: 'processing' })
+          .toArray();
+        statuses[workerId] = processingPosts.length > 0 ? 'busy' : 'idle';
+      } else {
+        statuses[workerId] = 'offline';
+      }
+    }
+
+    res.json(statuses);
+  } catch (error) {
+    console.error('Error checking status:', error);
+    res.status(500).json({ error: 'Failed to check status' });
+  }
+});
 
    // API Endpoints
    app.get('/api/posts', async (req, res) => {
@@ -146,29 +201,6 @@ require('dotenv').config();
      } catch (error) {
        console.error('Error adding post:', error);
        res.status(500).json({ error: 'Failed to add post' });
-     }
-   });
-
-   app.get('/api/status', async (req, res) => {
-     try {
-       const statuses = {
-         server1: true,
-         rabbitmq: !!channel,
-       };
-
-       // Check status for exactly three workers
-       const workers = ['worker-1', 'worker-2', 'worker-3'];
-       for (const workerId of workers) {
-         const processingPosts = await db.collection('posts')
-           .find({ worker: workerId, status: 'processing' })
-           .toArray();
-         statuses[workerId] = processingPosts.length > 0 ? 'busy' : 'idle';
-       }
-
-       res.json(statuses);
-     } catch (error) {
-       console.error('Error checking status:', error);
-       res.status(500).json({ error: 'Failed to check status' });
      }
    });
 
